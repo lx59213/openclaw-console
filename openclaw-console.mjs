@@ -46,12 +46,21 @@ const httpReq = (url, headers = {}) => new Promise((ok, fail) => {
 });
 const tail = (file, n = 50) => { try { const lines = fs.readFileSync(file, 'utf-8').split('\n'); return lines.slice(-n).join('\n'); } catch { return ''; } };
 
+/* ═══════ URL 规范化 ═══════ */
+
+// 统一 Base URL: 去尾斜杠，确保以 /v1 结尾
+// openclaw 内部拼 ${baseUrl}/chat/completions，必须带 /v1
+const normalizeBase = (raw) => {
+  const b = raw.replace(/\/+$/, '');
+  return b.endsWith('/v1') ? b : b + '/v1';
+};
+
 /* ═══════ 模型拉取 ═══════ */
 
 async function fetchAnthropic(baseUrl, apiKey) {
   const all = []; let after = null;
   for (let i = 0; i < 5; i++) {
-    const u = new URL(baseUrl.replace(/\/+$/, '') + '/v1/models');
+    const u = new URL(normalizeBase(baseUrl) + '/models');
     u.searchParams.set('limit', '100');
     if (after) u.searchParams.set('after_id', after);
     const raw = await httpReq(u.toString(), { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' });
@@ -68,7 +77,7 @@ async function fetchAnthropic(baseUrl, apiKey) {
   all.sort((a, b) => sortKey(b.id) - sortKey(a.id)); return all;
 }
 async function fetchOpenAI(baseUrl, apiKey) {
-  const raw = await httpReq(baseUrl.replace(/\/+$/, '') + '/v1/models', { 'Authorization': 'Bearer ' + apiKey });
+  const raw = await httpReq(normalizeBase(baseUrl) + '/models', { 'Authorization': 'Bearer ' + apiKey });
   return (JSON.parse(raw).data || []).map(m => ({
     id: m.id, name: m.id, reasoning: /^(o[1-9]|.*reason)/i.test(m.id), ctx: 128000, max: 8192,
     created: m.created ? new Date(m.created * 1000).toISOString() : ''
@@ -98,11 +107,16 @@ async function api(req, res) {
     catch (e) { J(res, { ok: false, error: e.message }, 500); } return;
   }
   if (u.pathname === '/api/fetch-models' && req.method === 'POST') {
+    let baseUrl = '';
     try {
-      const { baseUrl, apiKey, apiType } = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req));
+      baseUrl = body.baseUrl; const apiKey = body.apiKey; const apiType = body.apiType;
       const models = apiType === 'anthropic-messages' ? await fetchAnthropic(baseUrl, apiKey) : await fetchOpenAI(baseUrl, apiKey);
       J(res, { ok: true, models });
-    } catch (e) { J(res, { ok: false, error: e.message }, 500); } return;
+    } catch (e) {
+      const target = baseUrl ? normalizeBase(baseUrl) + '/models' : '(URL 为空)';
+      J(res, { ok: false, error: e.message, hint: `实际请求: ${target}` }, 500);
+    } return;
   }
 
   // 会话列表
@@ -297,7 +311,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 2px var(--acl)}
     <div style="display:flex;flex-direction:column;gap:12px">
       <div class="cd"><div class="ct-t">渠道信息</div>
         <div class="fr"><div class="fd"><span class="fl">Provider ID</span><input id="pId" placeholder="如 claude-aws"></div><div class="fd"><span class="fl">API 协议</span><select id="aT"><option value="anthropic-messages">anthropic-messages</option><option value="openai-completions">openai-completions</option></select></div></div>
-        <div class="fr"><div class="fd fu"><span class="fl">Base URL</span><input id="bU" placeholder="https://..."></div></div>
+        <div class="fr"><div class="fd fu"><span class="fl">Base URL <span style="font-weight:400;color:var(--tx3)">— 填原始地址即可，自动补全 /v1</span></span><input id="bU" placeholder="https://api.example.com 或 https://api.example.com/v1"></div></div>
         <div class="fr"><div class="fd fu"><span class="fl">API Key</span><input id="aK" placeholder="sk-..."></div></div>
       </div>
       <div class="cd"><div class="ct-t">选择模型 <span class="sub">— 从渠道 API 实时拉取</span></div>
@@ -365,10 +379,15 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 2px var(--acl)}
 <script>
 let C=null,FM=[],SM=null,EP=null;
 const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
+const normalizeBase=(raw)=>{const b=raw.replace(/\\/+$/,'');return b.endsWith('/v1')?b:b+'/v1'};
 
 /* ═══ Tab 切换 ═══ */
 $$('.tab').forEach(t=>t.onclick=()=>{$$('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');$$('.page').forEach(p=>p.classList.remove('active'));$('#pg-'+t.dataset.p).classList.add('active');
 if(t.dataset.p==='sessions')loadSessions();if(t.dataset.p==='logs')loadLogs();if(t.dataset.p==='ops')initOps()});
+
+/* ═══ API 协议切换时自动调整 UI ═══ */
+$('#aT').onchange=()=>{const isAnth=$('#aT').value==='anthropic-messages';
+$('#rE').disabled=!isAnth;if(!isAnth){$('#rE').checked=false}};
 
 /* ═══ Init ═══ */
 async function init(){
@@ -401,7 +420,7 @@ $('#fB').onclick=async()=>{const bU=$('#bU').value.trim(),aK=$('#aK').value.trim
 if(!bU){T('请先填 Base URL','er');return}if(!aK){T('请先填 API Key','er');return}
 $('#fB').disabled=true;$('#fS').textContent='请求中...';$('#mG').innerHTML='<div class="me" style="color:var(--ac)">正在拉取...</div>';
 try{const r=await(await fetch('/api/fetch-models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseUrl:bU,apiKey:aK,apiType:aT})})).json();
-if(!r.ok)throw new Error(r.error);FM=r.models;$('#fS').textContent=r.models.length+' 个模型';rMG()}
+if(!r.ok){const msg=r.error+(r.hint?'\\n'+r.hint:'');throw new Error(msg)}FM=r.models;$('#fS').textContent=r.models.length+' 个模型';rMG()}
 catch(e){$('#fS').textContent='失败';$('#mG').innerHTML='<div class="me" style="color:var(--dg)">拉取失败: '+e.message+'</div>';FM=[]}
 finally{$('#fB').disabled=false}};
 $('#mS').oninput=rMG;
@@ -412,7 +431,7 @@ g.innerHTML=ls.map(m=>'<div class="mo'+(SM===m.id?' se':'')+'" data-i="'+m.id+'"
 g.querySelectorAll('.mo').forEach(el=>el.onclick=()=>{const m=FM.find(x=>x.id===el.dataset.i);if(!m)return;SM=m.id;$('#mId').value=m.id;$('#mN').value=m.name;$('#cW').value=m.ctx;$('#mT').value=m.max;$('#rE').checked=m.reasoning;rMG()})}
 
 /* ═══ 写入配置 ═══ */
-$('#aB').onclick=()=>{const pId=$('#pId').value.trim(),aT=$('#aT').value,bU=$('#bU').value.trim(),aK=$('#aK').value.trim(),mId=$('#mId').value.trim(),mN=$('#mN').value.trim(),cW=parseInt($('#cW').value)||200000,mT=parseInt($('#mT').value)||8192,rE=$('#rE').checked,sP=$('#sP').checked;
+$('#aB').onclick=()=>{const pId=$('#pId').value.trim(),aT=$('#aT').value,bU=normalizeBase($('#bU').value.trim()),aK=$('#aK').value.trim(),mId=$('#mId').value.trim(),mN=$('#mN').value.trim(),cW=parseInt($('#cW').value)||200000,mT=parseInt($('#mT').value)||8192,rE=aT==='anthropic-messages'&&$('#rE').checked,sP=$('#sP').checked;
 if(!pId||!bU||!mId||!mN){T('必填项不能为空','er');return}
 const ent={id:mId,name:mN,reasoning:rE,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:cW,maxTokens:mT};
 const ps=C.models.providers;
